@@ -1,0 +1,14 @@
+[project]
+name = "2025postgresqlmcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "asyncpg>=0.31.0",
+    "mcp>=1.27.0",
+    "pydantic>=2.13.3",
+]
+
+[project.scripts]
+postgres-mcp = "main:main"
