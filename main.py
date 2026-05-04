@@ -2,43 +2,16 @@ import os
 import sys
 import asyncio
 import asyncpg
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
 from mcp.server import Server
-from mcp.server.sse import SseServerTransport
+from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
-import uvicorn
 
-# MCP Server definition
-mcp_server = Server("postgres-mcp-server")
+app = Server("postgres-mcp-server")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 pool: asyncpg.Pool | None = None
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global pool
-    if not DATABASE_URL:
-        print("DATABASE_URL environment variable is required.", file=sys.stderr)
-    else:
-        try:
-            print(f"Connecting to database: {DATABASE_URL}", file=sys.stderr)
-            pool = await asyncpg.create_pool(DATABASE_URL)
-            print("Database connection pool initialized successfully.", file=sys.stderr)
-        except Exception as e:
-            print(f"Failed to initialize database pool: {e}", file=sys.stderr)
-    
-    yield
-    
-    if pool:
-        print("Closing database connection pool.", file=sys.stderr)
-        await pool.close()
-
-# FastAPI App definition
-app = FastAPI(title="Postgres MCP Server", lifespan=lifespan)
-sse = SseServerTransport("/messages")
-
-@mcp_server.list_tools()
+@app.list_tools()
 async def list_tools() -> list[Tool]:
     return [
         Tool(
@@ -79,7 +52,7 @@ async def list_tools() -> list[Tool]:
         )
     ]
 
-@mcp_server.call_tool()
+@app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if not pool:
         return [TextContent(type="text", text="Error: Database connection pool not initialized. DATABASE_URL may be missing or invalid.")]
@@ -130,13 +103,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         try:
             async with pool.acquire() as conn:
                 async with conn.transaction(readonly=True):
-                    stmt = await conn.prepare(query)
-                    records = await stmt.fetch(100)
+                    # Use direct fetch to avoid prepared statement argument issues for general queries
+                    records = await conn.fetch(query)
                     
                     if not records:
                         return [TextContent(type="text", text="Query returned 0 rows.")]
                     
-                    keys = records[0].keys()
+                    keys = list(records[0].keys())
                     header = " | ".join(keys)
                     separator = "-" * len(header)
                     
@@ -144,7 +117,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     for record in records:
                         rows.append(" | ".join(str(record[k]) for k in keys))
                         
-                    result_text = f"{header}\n{separator}\n" + "\n".join(rows) + "\n\n(Limited to 100 rows max)"
+                    result_text = f"{header}\n{separator}\n" + "\n".join(rows) + "\n\n(Limited to records fetched)"
                     return [TextContent(type="text", text=result_text)]
                 
         except Exception as e:
@@ -153,21 +126,31 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     else:
         raise ValueError(f"Unknown tool: {name}")
 
-@app.get("/sse")
-async def handle_sse(request: Request):
-    async with sse.connect_sse(
-        request.scope, request.receive, request._send
-    ) as (read_stream, write_stream):
-        await mcp_server.run(
-            read_stream,
-            write_stream,
-            mcp_server.create_initialization_options(),
-        )
+async def main():
+    global pool
+    if not DATABASE_URL:
+        print("DATABASE_URL environment variable is required.", file=sys.stderr)
+    else:
+        try:
+            print(f"Connecting to database: {DATABASE_URL}", file=sys.stderr)
+            pool = await asyncpg.create_pool(DATABASE_URL)
+            print("Database connection pool initialized successfully.", file=sys.stderr)
+        except Exception as e:
+            print(f"Failed to initialize database pool: {e}", file=sys.stderr)
 
-@app.post("/messages")
-async def handle_messages(request: Request):
-    await sse.handle_post_message(request.scope, request.receive, request._send)
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(
+                read_stream,
+                write_stream,
+                app.create_initialization_options()
+            )
+    finally:
+        if pool:
+            print("Closing database connection pool.", file=sys.stderr)
+            await pool.close()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    asyncio.run(main())
+
 
