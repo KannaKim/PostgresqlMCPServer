@@ -28,7 +28,7 @@ Example connection string:
 ### Running directly
 
 ```bash
-DATABASE_URL="postgres://user:password@localhost:5432/mydatabase" uv run main.py
+DATABASE_URL="postgresql://postgres:poggerpogger@localhost:5432/boxboxWeb" uv run main.py
 ```
 
 ### Usage with Claude Desktop / MCP Clients

@@ -2,35 +2,43 @@ import os
 import sys
 import asyncio
 import asyncpg
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
 from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent
+import uvicorn
 
-app = Server("postgres-mcp-server")
+# MCP Server definition
+mcp_server = Server("postgres-mcp-server")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-
 pool: asyncpg.Pool | None = None
 
-@app.lifespan
-async def lifespan(server: Server):
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global pool
     if not DATABASE_URL:
         print("DATABASE_URL environment variable is required.", file=sys.stderr)
-        # We don't exit here so the server can still start and reply with errors if tools are called
     else:
         try:
+            print(f"Connecting to database: {DATABASE_URL}", file=sys.stderr)
             pool = await asyncpg.create_pool(DATABASE_URL)
-            yield
-        finally:
-            if pool:
-                await pool.close()
+            print("Database connection pool initialized successfully.", file=sys.stderr)
+        except Exception as e:
+            print(f"Failed to initialize database pool: {e}", file=sys.stderr)
     
-    # If DATABASE_URL is missing, we just yield and tools will return errors
-    if not pool:
-        yield
+    yield
+    
+    if pool:
+        print("Closing database connection pool.", file=sys.stderr)
+        await pool.close()
 
-@app.list_tools()
+# FastAPI App definition
+app = FastAPI(title="Postgres MCP Server", lifespan=lifespan)
+sse = SseServerTransport("/messages")
+
+@mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
         Tool(
@@ -71,7 +79,7 @@ async def list_tools() -> list[Tool]:
         )
     ]
 
-@app.call_tool()
+@mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if not pool:
         return [TextContent(type="text", text="Error: Database connection pool not initialized. DATABASE_URL may be missing or invalid.")]
@@ -121,15 +129,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
              
         try:
             async with pool.acquire() as conn:
-                # Execute the query wrapped in a CTE or just as is, but we'll run it inside a read-only transaction if possible
                 async with conn.transaction(readonly=True):
-                    # We wrap in a subquery to apply a safe limit of 100 rows if the user didn't apply one,
-                    # but simple execution is fine with standard fetch. We'll just fetch a limited number.
-                    # asyncpg fetch returns up to all rows. We can't easily parse SQL to insert LIMIT,
-                    # but since it's a read-only transaction, we just fetch normally.
-                    # A better way is using a cursor to limit rows.
                     stmt = await conn.prepare(query)
-                    records = await stmt.fetch(100) # Fetch at most 100 rows
+                    records = await stmt.fetch(100)
                     
                     if not records:
                         return [TextContent(type="text", text="Query returned 0 rows.")]
@@ -151,13 +153,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     else:
         raise ValueError(f"Unknown tool: {name}")
 
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(
+@app.get("/sse")
+async def handle_sse(request: Request):
+    async with sse.connect_sse(
+        request.scope, request.receive, request._send
+    ) as (read_stream, write_stream):
+        await mcp_server.run(
             read_stream,
             write_stream,
-            app.create_initialization_options()
+            mcp_server.create_initialization_options(),
         )
 
+@app.post("/messages")
+async def handle_messages(request: Request):
+    await sse.handle_post_message(request.scope, request.receive, request._send)
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
